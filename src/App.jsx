@@ -72,16 +72,16 @@ export default function App() {
     setJob(null);
     setShowRetry(false);
     setIsSubmitting(true);
-    setStatusMessage("Uploading images...");
+    setStatusMessage("Compressing and uploading images... (may take 30–60s on slow networks)");
 
     try {
-      // 1) Compress images on client
+      // Compress images
       const [compressedPerson, compressedClothing] = await Promise.all([
         compressImage(personFile, "person_image"),
         compressImage(clothingFile, "clothing_image"),
       ]);
 
-      // 2) Prepare FormData
+      // Build FormData
       const fd = new FormData();
       fd.append("person_image", compressedPerson || personFile);
       fd.append("clothing_image", compressedClothing || clothingFile);
@@ -98,30 +98,37 @@ export default function App() {
 
       console.log("Sending FormData request:", { url, options });
 
-      setStatusMessage("Uploading images to server...");
-      let resp = await fetchWithTimeout(url, options);
+      setStatusMessage("Uploading images to server... (up to 2 minutes)");
+      let resp;
+      let data;
 
-      let data = null;
-
-      if (!resp.ok) {
-        try {
-          data = await resp.json();
-        } catch {
-          throw new Error(`Server error: ${resp.status} ${resp.statusText}`);
-        }
-      } else {
-        data = await resp.json();
+      try {
+        resp = await fetchWithTimeout(url, options);
+      } catch (fetchErr) {
+        handleNetworkError(fetchErr);
+        throw fetchErr;
       }
 
-      // 3) Handle python-multipart fallback (JSON base64) if needed
-      if (!resp.ok) {
-        const msg = (data?.detail || "").toString().toLowerCase();
+      try {
+        data = await resp.json();
+      } catch (e) {
+        // Empty body / ERR_EMPTY_RESPONSE case
+        console.error("Empty / non-JSON response from /generate:", e);
+        throw new Error(
+          "Response empty - generation may have failed due to server error or slow network. Retry?"
+        );
+      }
+
+      if (!resp.ok || !data) {
+        const msg = data?.detail || data?.message || "Generate failed";
+        // Check for python-multipart hint for fallback
+        const lower = String(msg).toLowerCase();
         const shouldFallback =
-          resp.status === 415 || msg.includes("python-multipart");
+          resp.status === 415 || lower.includes("python-multipart");
 
         if (shouldFallback) {
           console.log("Falling back to JSON base64 encoding");
-          setStatusMessage("Encoding images...");
+          setStatusMessage("Encoding images before upload...");
 
           const personB64 = await fileToDataUrl(compressedPerson || personFile);
           const clothingB64 = await fileToDataUrl(
@@ -147,37 +154,50 @@ export default function App() {
             options: jsonOptions,
           });
 
-          setStatusMessage("Uploading JSON images to server...");
-          resp = await fetchWithTimeout(jsonUrl, jsonOptions);
+          setStatusMessage("Uploading encoded images to server...");
+          try {
+            resp = await fetchWithTimeout(jsonUrl, jsonOptions);
+            data = await resp.json();
+          } catch (fetchErr) {
+            handleNetworkError(fetchErr);
+            throw fetchErr;
+          }
 
-          data = await resp.json();
-          if (!resp.ok) {
-            throw new Error(data?.detail || "Generate failed");
+          if (!resp.ok || !data) {
+            throw new Error(
+              data?.detail ||
+                data?.message ||
+                "Generate failed after JSON fallback"
+            );
           }
         } else {
-          throw new Error(data?.detail || "Generate failed");
+          throw new Error(msg);
         }
       }
 
-      setStatusMessage("Generating result...");
       const jobId = data.job_id;
-      await pollJob(jobId);
+      if (!jobId) {
+        throw new Error(
+          data?.message ||
+            "Server did not return a job id. Generation may have failed."
+        );
+      }
+
+      setStatusMessage("Job queued. Generation may take 30–60s...");
+      await pollJobWithRetries(jobId);
       setStatusMessage("");
     } catch (e) {
       console.error("Generate error:", e);
       const msg = e?.message || String(e);
 
-      if (e.name === "AbortError") {
-        setError(
-          "Request timed out (over 2 minutes). Try smaller images or a more stable connection."
-        );
-      } else if (
+      if (
+        msg.includes("Response empty") ||
         msg.includes("Failed to fetch") ||
         msg.includes("ERR_CONNECTION_REFUSED") ||
         msg.includes("ERR_EMPTY_RESPONSE")
       ) {
         setError(
-          "Connection failed - check your internet connection or try smaller images. You can click Retry."
+          "Response empty / connection failed - generation may have failed due to server error or slow network. You can click Retry."
         );
       } else if (
         msg.toLowerCase().includes("unauthorized") ||
@@ -197,37 +217,106 @@ export default function App() {
     }
   }
 
-  async function pollJob(jobId) {
+  function handleNetworkError(err) {
+    const msg = err?.message || String(err);
+    console.error("Network error:", err);
+    if (err.name === "AbortError") {
+      setError(
+        "Request timed out (over 2 minutes). Try smaller images or a more stable connection."
+      );
+    } else if (
+      msg.includes("Failed to fetch") ||
+      msg.includes("ERR_CONNECTION_REFUSED") ||
+      msg.includes("ERR_EMPTY_RESPONSE")
+    ) {
+      setError(
+        "Connection failed - check your internet or try smaller images. Retry?"
+      );
+    } else {
+      setError(msg);
+    }
+    setShowRetry(true);
+  }
+
+  async function pollJobWithRetries(jobId) {
+    const maxRetries = 5;
+    let attempt = 0;
     const started = Date.now();
 
     while (true) {
-      const url = config.apiUrl(`jobs/${jobId}`);
-      const options = {
-        headers: {
-          Authorization: buildAuthHeader(),
-        },
-      };
-      console.log("Polling job:", { url, options });
+      try {
+        const data = await pollJobOnce(jobId);
+        setJob(data);
 
-      const resp = await fetchWithTimeout(url, options, 30000); // 30s per poll
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data?.detail || "Job status failed");
+        if (data.status === "succeeded") return;
+        if (data.status === "failed") {
+          throw new Error(
+            data.message ||
+              "Generation failed on server (see backend logs or Forge)."
+          );
+        }
+      } catch (e) {
+        attempt += 1;
+        console.error(`pollJob attempt ${attempt} failed:`, e);
+        if (attempt >= maxRetries) {
+          throw new Error(
+            `Failed to fetch job status after ${maxRetries} retries. ${e?.message || e}`
+          );
+        }
+        // Wait 5 seconds then retry
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
 
-      setJob(data);
+      if (Date.now() - started > 180_000) {
+        throw new Error(
+          "Timed out waiting for generation (over 3 minutes). Try again with smaller images."
+        );
+      }
 
-      if (data.status === "succeeded") return;
-      if (data.status === "failed")
-        throw new Error(data.message || "Generation failed");
-
-      if (Date.now() - started > 180_000)
-        throw new Error("Timed out waiting for generation");
-
-      await new Promise((r) => setTimeout(r, 1200));
+      // Short delay between successful polls
+      await new Promise((r) => setTimeout(r, 1500));
     }
+  }
+
+  async function pollJobOnce(jobId) {
+    const url = config.apiUrl(`jobs/${jobId}`);
+    const options = {
+      headers: {
+        Authorization: buildAuthHeader(),
+      },
+    };
+    console.log("Polling job:", { url, options });
+
+    let resp;
+    try {
+      resp = await fetchWithTimeout(url, options, 60000); // 60s per poll
+    } catch (err) {
+      handleNetworkError(err);
+      throw err;
+    }
+
+    let data;
+    try {
+      data = await resp.json();
+    } catch (e) {
+      console.error("Empty / non-JSON response from /jobs:", e);
+      // Treat empty response as "pending" so we keep polling
+      return { status: "pending", message: "No response body yet" };
+    }
+
+    if (!resp.ok || !data) {
+      throw new Error(
+        data?.detail || data?.message || "Job status failed on server"
+      );
+    }
+
+    return data;
   }
 
   const handleRetry = () => {
     setShowRetry(false);
+    setError("");
     startGenerate();
   };
 
@@ -267,11 +356,9 @@ export default function App() {
               {statusMessage && (
                 <div style={{ marginTop: 4 }}>{statusMessage}</div>
               )}
-              {isSubmitting && (
-                <div style={{ marginTop: 4, fontSize: "0.9em" }}>
-                  Uploading / generating... please wait (up to 2 minutes).
-                </div>
-              )}
+              <div style={{ marginTop: 4, fontSize: "0.9em" }}>
+                Generation may take 30–60s on slow networks.
+              </div>
               {showRetry && (
                 <button
                   className="btn"

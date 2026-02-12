@@ -25,8 +25,13 @@ if (useNgrok && envNgrokUrl) {
   API_BASE_URL = "http://74.48.78.46:25147";
 }
 
+// Backend timeout for slow uploads / long generations (ms)
+const timeoutEnv = parseInt(import.meta.env.VITE_BACKEND_TIMEOUT ?? "120000", 10);
+const BACKEND_TIMEOUT_MS = Number.isFinite(timeoutEnv) && timeoutEnv > 0 ? timeoutEnv : 120000;
+
 export const config = {
   apiBaseUrl: API_BASE_URL,
+  backendTimeoutMs: BACKEND_TIMEOUT_MS,
   apiUrl: (path) => {
     const clean = path.startsWith("/") ? path.slice(1) : path;
     return `${API_BASE_URL}/${clean}`;

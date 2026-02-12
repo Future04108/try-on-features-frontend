@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { config } from "../config.js";
 
 function Spinner({ label }) {
   return (
@@ -31,7 +32,11 @@ function ZoomModal({ src, onClose }) {
 export default function ResultDisplay({ personPreview, clothingPreview, job, isSubmitting }) {
   const [zoomSrc, setZoomSrc] = useState("");
 
-  const resultUrl = useMemo(() => job?.result_url || "", [job]);
+  const resultUrl = useMemo(() => {
+    if (!job?.result_url) return "";
+    // Convert relative URL to absolute URL if needed
+    return config.resultsUrl(job.result_url);
+  }, [job]);
   const statusLabel = useMemo(() => {
     if (!job) return "";
     const pct = Math.round((job.progress || 0) * 100);
